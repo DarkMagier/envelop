@@ -1,0 +1,1068 @@
+package main
+
+import (
+	"log"
+	"time"
+
+	"envelop/envelop"
+	"envelop/netquic"
+	"envelop/peer"
+	"envelop/router"
+	"envelop/strategy"
+)
+
+const (
+	RPC_ECHO      = "RPC_ECHO"
+	RPC_ECHO_RESP = "RPC_ECHO_RESP"
+)
+
+func main() {
+
+	/****************************************************
+	 * 1. 三个节点：Alice → Relay → Bob
+	 ****************************************************/
+	aliceKP, _ := peer.NewKeyPair()
+	relayKP, _ := peer.NewKeyPair()
+	bobKP, _ := peer.NewKeyPair()
+
+	registry := netquic.NewRelayRegistry()
+	rt := router.NewRouteTable()
+
+	// 静态可达
+	registry.RegisterStatic(relayKP.PeerID, "127.0.0.1:9401")
+	registry.RegisterStatic(bobKP.PeerID, "127.0.0.1:9402")
+	registry.RegisterStatic(aliceKP.PeerID, "127.0.0.1:9403")
+
+	rt.LearnDirect(relayKP.PeerID)
+	rt.LearnDirect(bobKP.PeerID)
+	rt.LearnDirect(aliceKP.PeerID)
+
+	onion := strategy.NewOnionStrategy()
+
+	/****************************************************
+	 * 2. Relay：只做拆一层 + 转发
+	 ****************************************************/
+	relayNode := &netquic.Node{
+		Name:     "Relay",
+		Key:      relayKP,
+		PeerMgr:  netquic.NewPeerManager(registry.Resolver),
+		Registry: registry,
+	}
+
+	relayRouter := &router.Router{
+		SelfID:     relayKP.PeerID,
+		RouteTable: rt,
+		NextHop:    func(dest peer.PeerID) (peer.PeerID, bool) { return dest, true },
+		Send: func(nextHop peer.PeerID, env *envelop.Envelope) {
+			log.Printf("[Relay Router] 转发到 %s", peer.PeerIDToDomain(nextHop))
+			relayNode.PeerMgr.SendToPeer(nextHop, env)
+		},
+		OnPayload: func(env *envelop.Envelope) {
+			// Relay 业务：不处理
+		},
+	}
+
+	relayNode.Router = relayRouter
+
+	/****************************************************
+	 * 3. Bob：处理 RPC + 回包（也用 Onion）
+	 ****************************************************/
+	bobNode := &netquic.Node{
+		Name:     "Bob",
+		Key:      bobKP,
+		PeerMgr:  netquic.NewPeerManager(registry.Resolver),
+		Registry: registry,
+	}
+
+	bobNode.Router = &router.Router{
+		SelfID: bobKP.PeerID,
+		OnPayload: func(env *envelop.Envelope) {
+
+			msg := string(env.InnerPayload)
+			log.Printf("[Bob] OnPayload 收到: %q", msg)
+
+			if len(msg) >= len(RPC_ECHO)+1 &&
+				msg[:len(RPC_ECHO)] == RPC_ECHO {
+
+				payload := msg[len(RPC_ECHO)+1:] // 去掉 RPC_ECHO:
+				log.Printf("[Bob] 识别到 RPC_ECHO 请求，内容 = %q", payload)
+
+				respPayload := []byte(RPC_ECHO_RESP + ":" + payload)
+
+				// 使用 OnionStrategy → Bob → Relay → Alice
+				respEnv, _ := onion.BuildEnvelope(
+					env.ReturnPeerID, // dest = Alice
+					bobKP.PeerID,     // from
+					respPayload,
+					[]peer.PeerID{relayKP.PeerID},
+				)
+
+				log.Printf("[Bob] 准备回 RPC 响应给 %s", peer.PeerIDToDomain(env.ReturnPeerID))
+				bobNode.PeerMgr.SendToPeer(relayKP.PeerID, respEnv)
+				log.Println("[Bob] RPC 响应已发送")
+			}
+		},
+	}
+
+	/****************************************************
+	 * 4. Alice：发 Onion RPC
+	 ****************************************************/
+	aliceNode := &netquic.Node{
+		Name:     "Alice",
+		Key:      aliceKP,
+		PeerMgr:  netquic.NewPeerManager(registry.Resolver),
+		Registry: registry,
+	}
+
+	aliceNode.Router = &router.Router{
+		SelfID: aliceKP.PeerID,
+		OnPayload: func(env *envelop.Envelope) {
+			msg := string(env.InnerPayload)
+			log.Printf("[Alice] OnPayload 收到: %q", msg)
+
+			if len(msg) >= len(RPC_ECHO_RESP)+1 &&
+				msg[:len(RPC_ECHO_RESP)] == RPC_ECHO_RESP {
+
+				payload := msg[len(RPC_ECHO_RESP)+1:]
+				log.Printf("[Alice] 收到 RPC_ECHO 响应，结果 = %q", payload)
+			}
+		},
+	}
+
+	/****************************************************
+	 * 5. 启动所有节点
+	 ****************************************************/
+	go relayNode.ListenAndServe("0.0.0.0:9401")
+	go bobNode.ListenAndServe("0.0.0.0:9402")
+	go aliceNode.ListenAndServe("0.0.0.0:9403")
+	time.Sleep(time.Second)
+
+	/****************************************************
+	 * 6. Alice → Onion RPC → Bob
+	 ****************************************************/
+	log.Printf("[Alice] PeerID = %s", peer.PeerIDToDomain(aliceKP.PeerID))
+	log.Printf("[Relay] PeerID = %s", peer.PeerIDToDomain(relayKP.PeerID))
+	log.Printf("[Bob]   PeerID = %s", peer.PeerIDToDomain(bobKP.PeerID))
+
+	payload := []byte(RPC_ECHO + ":Hello Bob, this is Alice via Onion RPC!")
+
+	// 构造 Onion RPC：path = [Relay]
+	reqEnv, _ := onion.BuildEnvelope(
+		bobKP.PeerID,   // final dest = Bob
+		aliceKP.PeerID, // Alice
+		payload,
+		[]peer.PeerID{relayKP.PeerID},
+	)
+
+	log.Printf("[Alice] 准备发送 Onion RPC：外层 Dest = %s",
+		peer.PeerIDToDomain(relayKP.PeerID),
+	)
+
+	aliceNode.PeerMgr.SendToPeer(relayKP.PeerID, reqEnv)
+	log.Println("[Alice] Onion RPC 已发出")
+
+	time.Sleep(3 * time.Second)
+	log.Println("==== Onion RPC Demo 结束 ====")
+}
+
+//package main
+//
+//import (
+//	"log"
+//	"strings"
+//	"time"
+//
+//	"envelop/envelop"
+//	"envelop/netquic"
+//	"envelop/peer"
+//	"envelop/router"
+//)
+//
+///*
+//==========================================================
+//         RPC + Onion Demo 总体说明
+//==========================================================
+//
+//我们要做的事情：
+//
+//  Alice  ----(Onion RPC 请求)---->  Relay  ---->  Bob
+//  Alice  <----------------------(RPC 响应)------  Bob
+//
+//- "Onion" 的含义：不是一定要加密，而是“多层信封套娃”。
+//- 在这个 Demo 里，我们用两层信封：
+//    外层信封：Dest = Relay
+//    内层信封：Dest = Bob，Payload = RPC 字符串
+//
+//- Relay 的行为：
+//    1. 收到外层信封，发现 Dest 是自己 → 拆信封
+//    2. 内层是一个完整 Envelope → 再交给 Router.HandleEnvelope
+//    3. 内层 Dest = Bob → 走 Router.NextHop + Send 转发给 Bob
+//
+//- Bob 的行为：
+//    1. 收到内层信封，Dest = Bob → 拆信封
+//    2. InnerPayload 是 RPC 文本，比如 "RPC_ECHO:Hello"
+//    3. 执行 RPC handler（这里做一个最简单的 Echo）
+//    4. 回一个新信封：Dest = Alice，Payload = "RPC_ECHO_RESP:Hello"
+//
+//- Alice 的行为：
+//    1. 在 OnPayload 里识别 RPC_ECHO_RESP
+//    2. 打印结果，证明整个 Onion RPC 跑通
+//
+//注意：
+//- 整个过程用的还是你已经有的：
+//    QUIC + Frame(v2) + Envelope + Router
+//- Onion 完全是通过“InnerPayload 里塞一个序列化过的 Envelope”实现的。
+//
+//==========================================================
+//*/
+//
+//// RPC 文本协议前缀
+//const (
+//	RPCEchoReqPrefix  = "RPC_ECHO:"      // 请求：RPC_ECHO:xxxx
+//	RPCEchoRespPrefix = "RPC_ECHO_RESP:" // 响应：RPC_ECHO_RESP:xxxx
+//)
+//
+//func main() {
+//	// ======================================================
+//	// 1. 创建三个节点的身份（PeerID）
+//	// ======================================================
+//	aliceKP, _ := peer.NewKeyPair()
+//	relayKP, _ := peer.NewKeyPair()
+//	bobKP, _ := peer.NewKeyPair()
+//
+//	log.Println("==== Onion RPC Demo 启动 ====")
+//	log.Println("[Alice] PeerID =", peer.PeerIDToDomain(aliceKP.PeerID))
+//	log.Println("[Relay] PeerID =", peer.PeerIDToDomain(relayKP.PeerID))
+//	log.Println("[Bob]   PeerID =", peer.PeerIDToDomain(bobKP.PeerID))
+//
+//	// ======================================================
+//	// 2. 地址规划 + 注册到 RelayRegistry
+//	// ======================================================
+//	const (
+//		listenRelay = "0.0.0.0:9301"
+//		listenBob   = "0.0.0.0:9302"
+//		listenAlice = "0.0.0.0:9303"
+//
+//		dialRelay = "127.0.0.1:9301"
+//		dialBob   = "127.0.0.1:9302"
+//		dialAlice = "127.0.0.1:9303"
+//	)
+//
+//	// RelayRegistry 负责 PeerID ↔ 地址 的映射
+//	relayRegistry := netquic.NewRelayRegistry()
+//	relayRegistry.RegisterStatic(relayKP.PeerID, dialRelay)
+//	relayRegistry.RegisterStatic(bobKP.PeerID, dialBob)
+//	relayRegistry.RegisterStatic(aliceKP.PeerID, dialAlice)
+//
+//	// ======================================================
+//	// 3. Relay 节点：负责中转 + Onion 拆包
+//	// ======================================================
+//	relayNode := &netquic.Node{
+//		Name:     "Relay",
+//		Key:      relayKP,
+//		PeerMgr:  netquic.NewPeerManager(relayRegistry.Resolver),
+//		Registry: relayRegistry,
+//	}
+//
+//	relayRouter := &router.Router{
+//		SelfID: relayKP.PeerID,
+//
+//		/*
+//		   Relay 的路由逻辑很简单：
+//
+//		     - 对于任何目标 dest：
+//		         下一跳就是 dest 本身（直连）
+//		         即：NextHop(dest) = dest
+//
+//		   这样：
+//		     - 外层信封 Dest=Relay 时，Relay 会拆信封
+//		     - 内层信封 Dest=Bob 时，Relay 通过 NextHop=Bob 直接发给 Bob
+//		*/
+//		NextHop: func(dest peer.PeerID) (peer.PeerID, bool) {
+//			return dest, true
+//		},
+//
+//		// 真正发包由 PeerMgr 负责（PeerID → 地址 → QUIC Conn）
+//		Send: func(nextHop peer.PeerID, env *envelop.Envelope) {
+//			log.Printf("[Relay Router] 转发到 %s", peer.PeerIDToDomain(nextHop))
+//			if err := relayNode.PeerMgr.SendToPeer(nextHop, env); err != nil {
+//				log.Printf("[Relay] 转发失败: %v", err)
+//			}
+//		},
+//
+//		OnPayload: func(env *envelop.Envelope) {
+//			// 在这个 Demo 里，Relay 不处理业务数据，
+//			// 它的作用只是“中转 + 拆 Onion”。
+//			log.Printf("[Relay] 收到最终业务数据: %q", string(env.InnerPayload))
+//		},
+//	}
+//	relayNode.Router = relayRouter
+//
+//	// ======================================================
+//	// 4. Bob 节点：RPC 服务器（执行 RPC_ECHO）
+//	// ======================================================
+//	bobNode := &netquic.Node{
+//		Name:     "Bob",
+//		Key:      bobKP,
+//		PeerMgr:  netquic.NewPeerManager(relayRegistry.Resolver),
+//		Registry: relayRegistry,
+//	}
+//
+//	bobRouter := &router.Router{
+//		SelfID: bobKP.PeerID,
+//
+//		OnPayload: func(env *envelop.Envelope) {
+//			// 收到的是最内层信封的业务数据。
+//			msg := string(env.InnerPayload)
+//			log.Printf("[Bob] OnPayload 收到: %q", msg)
+//
+//			// 1) 识别 RPC_ECHO 请求
+//			if strings.HasPrefix(msg, RPCEchoReqPrefix) {
+//				// 提取要 Echo 的内容
+//				body := strings.TrimPrefix(msg, RPCEchoReqPrefix)
+//				log.Printf("[Bob] 识别到 RPC_ECHO 请求，内容 = %q", body)
+//
+//				// 2) 构造 RPC_ECHO_RESP
+//				respStr := RPCEchoRespPrefix + body
+//				respPayload := []byte(respStr)
+//
+//				// 3) 构造响应信封：
+//				//    Dest = 请求里的 ReturnPeerID（Alice）
+//				//    Return = Bob 自己
+//				respEnv, _ := envelop.NewBuilder().
+//					Version(1).
+//					Flags(0).
+//					TTL(5).
+//					Dest(env.ReturnPeerID).
+//					Return(bobKP.PeerID).
+//					Payload(respPayload).
+//					Build()
+//
+//				log.Printf("[Bob] 准备回 RPC 响应给 %s", peer.PeerIDToDomain(env.ReturnPeerID))
+//
+//				// 这里我们让响应“走简单路径”：直接发给 Alice，不再 Onion。
+//				if err := bobNode.PeerMgr.SendToPeer(env.ReturnPeerID, respEnv); err != nil {
+//					log.Printf("[Bob] 发送 RPC 响应失败: %v", err)
+//				} else {
+//					log.Println("[Bob] RPC 响应已发送")
+//				}
+//				return
+//			}
+//
+//			// 非 RPC_ECHO 的业务，这里就只是打印一下
+//			log.Printf("[Bob] 普通业务数据: %q", msg)
+//		},
+//	}
+//	bobNode.Router = bobRouter
+//
+//	// ======================================================
+//	// 5. Alice 节点：RPC 客户端（发起 Onion RPC）
+//	// ======================================================
+//	aliceNode := &netquic.Node{
+//		Name:     "Alice",
+//		Key:      aliceKP,
+//		PeerMgr:  netquic.NewPeerManager(relayRegistry.Resolver),
+//		Registry: relayRegistry,
+//	}
+//
+//	aliceRouter := &router.Router{
+//		SelfID: aliceKP.PeerID,
+//
+//		OnPayload: func(env *envelop.Envelope) {
+//			msg := string(env.InnerPayload)
+//			log.Printf("[Alice] OnPayload 收到: %q", msg)
+//
+//			// 识别 RPC_ECHO 响应
+//			if strings.HasPrefix(msg, RPCEchoRespPrefix) {
+//				body := strings.TrimPrefix(msg, RPCEchoRespPrefix)
+//				log.Printf("[Alice] 收到 RPC_ECHO 响应，结果 = %q", body)
+//				return
+//			}
+//
+//			log.Println("[Alice] 普通业务数据:", msg)
+//		},
+//	}
+//	aliceNode.Router = aliceRouter
+//
+//	// ======================================================
+//	// 6. 启动三个节点的 QUIC 监听
+//	// ======================================================
+//	go relayNode.ListenAndServe(listenRelay)
+//	go bobNode.ListenAndServe(listenBob)
+//	go aliceNode.ListenAndServe(listenAlice)
+//
+//	time.Sleep(time.Second) // 等待监听建立
+//
+//	// ======================================================
+//	// 7. Alice 构造一个 “Onion RPC 请求” 信封并发送
+//	// ======================================================
+//	rpcBody := "Hello Bob, this is Alice via Onion RPC!"
+//	rpcPayload := []byte(RPCEchoReqPrefix + rpcBody)
+//
+//	// 构造 Onion 信封：
+//	//   最内层：Dest = Bob, Return = Alice, Payload = RPC_ECHO:...
+//	//   外    层：Dest = Relay, Return = Alice, Payload = innerEnvelopeBytes
+//	onionEnv := buildOnionRPCEnvelope(
+//		aliceKP.PeerID,
+//		relayKP.PeerID,
+//		bobKP.PeerID,
+//		rpcPayload,
+//	)
+//
+//	log.Printf("[Alice] 准备发送 Onion RPC：外层 Dest = %s",
+//		peer.PeerIDToDomain(onionEnv.DestPeerID),
+//	)
+//
+//	if err := aliceNode.PeerMgr.SendToPeer(onionEnv.DestPeerID, onionEnv); err != nil {
+//		log.Println("[Alice] Onion RPC 发送失败:", err)
+//	} else {
+//		log.Println("[Alice] Onion RPC 已发出")
+//	}
+//
+//	// 等待一会儿观察整个流程
+//	time.Sleep(3 * time.Second)
+//
+//	log.Println("==== Onion RPC Demo 结束 ====")
+//}
+//
+///*
+//==========================================================
+//
+//	buildOnionRPCEnvelope: 手工构造一条 Onion 信封链路
+//
+//==========================================================
+//
+//层次结构：
+//
+//	[OuterEnvelope]
+//	    Version=1
+//	    Flags=0
+//	    TTL=5
+//	    DestPeerID   = Relay
+//	    ReturnPeerID = Alice
+//	    InnerPayload = Marshal(InnerEnvelope)
+//
+//	[InnerEnvelope]
+//	    Version=1
+//	    Flags=0
+//	    TTL=5
+//	    DestPeerID   = Bob
+//	    ReturnPeerID = Alice
+//	    InnerPayload = rpcPayload (RPC_ECHO:xxxxx)
+//
+//Router 的处理过程（关键）：
+//
+// 1. Relay 收到 OuterEnvelope：
+//    Dest = Relay → 是给自己的信封
+//    InnerPayload 能成功 Unmarshal → 递归 r.HandleEnvelope(innerEnv)
+//
+// 2. Relay 再处理 InnerEnvelope：
+//    Dest = Bob ≠ Relay → 走 NextHop+Send 转发给 Bob
+//
+// 3. Bob 收到 InnerEnvelope：
+//    Dest = Bob → 是给自己的信封
+//    InnerPayload 不是合法 Envelope（只是字符串） → 当作业务数据，交给 OnPayload
+//*/
+//func buildOnionRPCEnvelope(
+//	aliceID, relayID, bobID peer.PeerID,
+//	rpcPayload []byte,
+//) *envelop.Envelope {
+//	// -------------------------------
+//	// 1. 最内层信封：Dest = Bob
+//	// -------------------------------
+//	inner, _ := envelop.NewBuilder().
+//		Version(1).
+//		Flags(0).
+//		TTL(5).
+//		Dest(bobID).
+//		Return(aliceID).
+//		Payload(rpcPayload).
+//		Build()
+//
+//	innerBytes := inner.Marshal() // 序列化为 []byte，塞进外层的 InnerPayload
+//
+//	// -------------------------------
+//	// 2. 外层信封：Dest = Relay
+//	// -------------------------------
+//	outer, _ := envelop.NewBuilder().
+//		Version(1).
+//		Flags(0).
+//		TTL(5).
+//		Dest(relayID).
+//		Return(aliceID).
+//		Payload(innerBytes). // 这里把【内层信封的二进制】当作 payload
+//		Build()
+//
+//	return outer
+//}
+//
+////package main
+////
+////import (
+////	"envelop/peer"
+////	"envelop/router"
+////	"log"
+////	"strings"
+////)
+//
+/////****************************************************
+//// * R8.2：基于 Envelope 的 FIND_NODE “伪 RPC” Demo
+//// *
+//// * 栈结构回顾：
+//// *   QUIC → Frame → Envelope → Router → KademliaTable
+//// *
+//// * 在这个 Demo 里，我们用非常简单的字符串协议：
+//// *
+//// *   请求：
+//// *      FIND_NODE:<targetPeerID.env>
+//// *
+//// *   响应：
+//// *      FIND_NODE_RESP:<targetPeerID.env>:<peer1.env>,<peer2.env>,...
+//// *
+//// * 整个过程：
+//// *   Alice  ----FIND_NODE---->  Bootstrap DHT 节点
+//// *   Alice <---FIND_NODE_RESP-- Bootstrap DHT 节点
+//// *
+//// ****************************************************/
+////
+////// 控制报文前缀
+////const (
+////	CtrlFindNodeReq  = "FIND_NODE"      // 请求：FIND_NODE:<target>
+////	CtrlFindNodeResp = "FIND_NODE_RESP" // 响应：FIND_NODE_RESP:<target>:p1,p2,...
+////)
+////
+////func main() {
+////	/****************************************************
+////	 * 1. 准备两个真正的网络节点：Bootstrap + Alice
+////	 ****************************************************/
+////	bootstrapKP, _ := peer.NewKeyPair()
+////	aliceKP, _ := peer.NewKeyPair()
+////
+////	// 我们再生成几个“虚拟节点”，只存在于 Bootstrap 的路由表里
+////	// 它们不跑实际的 netquic.Node，只是参与 Kademlia ID 空间。
+////	var seedIDs []peer.PeerID
+////	for i := 0; i < 8; i++ {
+////		kp, _ := peer.NewKeyPair()
+////		seedIDs = append(seedIDs, kp.PeerID)
+////	}
+////
+////	// 选一个“目标节点 ID”来做 FIND_NODE 的目标
+////	targetKP, _ := peer.NewKeyPair()
+////	targetID := targetKP.PeerID
+////
+////	log.Println("==== R8 FIND_NODE Demo 启动 ====")
+////	log.Println("[Bootstrap] PeerID =", peer.PeerIDToDomain(bootstrapKP.PeerID))
+////	log.Println("[Alice]     PeerID =", peer.PeerIDToDomain(aliceKP.PeerID))
+////	for i, id := range seedIDs {
+////		log.Printf("[Bootstrap] Seed[%d] = %s", i, peer.PeerIDToDomain(id))
+////	}
+////	log.Println("[Target]    PeerID =", peer.PeerIDToDomain(targetID))
+////
+////	/****************************************************
+////	 * 2. Bootstrap 节点的 Kademlia 表：预先喂入 seedIDs
+////	 ****************************************************/
+////	kadBootstrap := router.NewKademliaTable(bootstrapKP.PeerID)
+////	for _, id := range seedIDs {
+////		kadBootstrap.Update(id)
+////	}
+////
+////	/****************************************************
+////	 * 3. 建立地址数据库 RelayRegistry + 静态注册
+////	 ****************************************************/
+////	relayRegistry := netquic.NewRelayRegistry()
+////
+////	const (
+////		listenBootstrap = "0.0.0.0:9201"
+////		listenAlice     = "0.0.0.0:9202"
+////
+////		dialBootstrap = "127.0.0.1:9201"
+////		dialAlice     = "127.0.0.1:9202"
+////	)
+////
+////	// 静态注册：PeerID → 地址
+////	relayRegistry.RegisterStatic(bootstrapKP.PeerID, dialBootstrap)
+////	relayRegistry.RegisterStatic(aliceKP.PeerID, dialAlice)
+////
+////	/****************************************************
+////	 * 4. 构建 Bootstrap 节点（带 Router + Kademlia）
+////	 ****************************************************/
+////	bootstrapNode := &netquic.Node{
+////		Name:     "Bootstrap",
+////		Key:      bootstrapKP,
+////		PeerMgr:  netquic.NewPeerManager(relayRegistry.Resolver),
+////		Registry: relayRegistry,
+////	}
+////
+////	bootstrapRouter := &router.Router{
+////		SelfID: bootstrapKP.PeerID,
+////
+////		// 这里我们只关心“最后一跳的业务数据”：
+////		OnPayload: func(env *envelop.Envelope) {
+////			msg := string(env.InnerPayload)
+////			log.Printf("[Bootstrap] OnPayload 收到: %q", msg)
+////
+////			// 如果是 FIND_NODE 请求，就调用 handler
+////			if strings.HasPrefix(msg, CtrlFindNodeReq+":") {
+////				handleFindNodeReq(kadBootstrap, bootstrapNode, env, msg)
+////				return
+////			}
+////
+////			log.Println("[Bootstrap] 非 FIND_NODE 业务，当前 Demo 不处理。")
+////		},
+////	}
+////
+////	bootstrapNode.Router = bootstrapRouter
+////
+////	/****************************************************
+////	 * 5. 构建 Alice 节点（也有自己的 Kademlia 表）
+////	 ****************************************************/
+////	aliceKad := router.NewKademliaTable(aliceKP.PeerID)
+////
+////	aliceNode := &netquic.Node{
+////		Name:     "Alice",
+////		Key:      aliceKP,
+////		PeerMgr:  netquic.NewPeerManager(relayRegistry.Resolver),
+////		Registry: relayRegistry,
+////	}
+////
+////	aliceRouter := &router.Router{
+////		SelfID: aliceKP.PeerID,
+////
+////		OnPayload: func(env *envelop.Envelope) {
+////			msg := string(env.InnerPayload)
+////			log.Printf("[Alice] OnPayload 收到: %q", msg)
+////
+////			// 处理 FIND_NODE 响应
+////			if strings.HasPrefix(msg, CtrlFindNodeResp+":") {
+////				handleFindNodeResp(aliceKad, msg)
+////				return
+////			}
+////
+////			log.Println("[Alice] 普通业务数据:", msg)
+////		},
+////	}
+////
+////	aliceNode.Router = aliceRouter
+////
+////	/****************************************************
+////	 * 6. 启动 Bootstrap + Alice 的 QUIC 监听
+////	 ****************************************************/
+////	go bootstrapNode.ListenAndServe(listenBootstrap)
+////	go aliceNode.ListenAndServe(listenAlice)
+////
+////	time.Sleep(time.Second) // 等监听起来
+////
+////	/****************************************************
+////	 * 7. Alice → Bootstrap 发送 FIND_NODE 请求
+////	 ****************************************************/
+////	targetDomain := peer.PeerIDToDomain(targetID)
+////	reqStr := CtrlFindNodeReq + ":" + targetDomain
+////	reqPayload := []byte(reqStr)
+////
+////	envReq, _ := envelop.NewBuilder().
+////		Version(1).
+////		Flags(0).
+////		TTL(5).
+////		Dest(bootstrapKP.PeerID).
+////		Return(aliceKP.PeerID).
+////		Payload(reqPayload).
+////		Build()
+////
+////	log.Println("[Alice] 发送 FIND_NODE 请求:", reqStr)
+////
+////	if err := aliceNode.PeerMgr.SendToPeer(bootstrapKP.PeerID, envReq); err != nil {
+////		log.Println("[Alice] 发送失败:", err)
+////	}
+////
+////	// 等待一会儿让响应来回跑完
+////	time.Sleep(2 * time.Second)
+////
+////	/****************************************************
+////	 * 8. 看看 Alice 的 Kademlia 表里学到了哪些节点
+////	 ****************************************************/
+////	known := aliceKad.FindClosest(aliceKP.PeerID, 32) // 查一下离自己最近的若干节点
+////	log.Println("==== Alice Kademlia 表中已知的节点 ====")
+////	for i, id := range known {
+////		log.Printf("[Alice] Known[%d] = %s", i, peer.PeerIDToDomain(id))
+////	}
+////
+////	log.Println("==== R8 FIND_NODE Demo 结束 ====")
+////}
+////
+/////****************************************************
+//// * Bootstrap：处理 FIND_NODE 请求
+//// *
+//// *  收到 payload:  "FIND_NODE:<targetDomain>"
+//// ****************************************************/
+////func handleFindNodeReq(
+////	kad *router.KademliaTable,
+////	node *netquic.Node,
+////	env *envelop.Envelope,
+////	msg string,
+////) {
+////	parts := strings.SplitN(msg, ":", 2)
+////	if len(parts) != 2 {
+////		log.Println("[Bootstrap] FIND_NODE 格式错误:", msg)
+////		return
+////	}
+////
+////	targetDomain := parts[1]
+////	targetID, err := peer.DomainToPeerID(targetDomain)
+////	if err != nil {
+////		log.Println("[Bootstrap] 解析 target PeerID 失败:", err)
+////		return
+////	}
+////
+////	// 在 Bootstrap 自己的 Kademlia 表里，找 N 个与 target 最近的节点
+////	const N = 4
+////	closest := kad.FindClosest(targetID, N)
+////	if len(closest) == 0 {
+////		log.Println("[Bootstrap] Kademlia 表中没有可用节点，无法回答 FIND_NODE")
+////		return
+////	}
+////
+////	// 把这些 PeerID 转成 base32 域名
+////	var peerDomains []string
+////	for _, id := range closest {
+////		peerDomains = append(peerDomains, peer.PeerIDToDomain(id))
+////	}
+////
+////	respStr := CtrlFindNodeResp + ":" + targetDomain + ":" + strings.Join(peerDomains, ",")
+////	respPayload := []byte(respStr)
+////
+////	log.Printf("[Bootstrap] 回复 FIND_NODE：target=%s, peers=%v", targetDomain, peerDomains)
+////
+////	respEnv, _ := envelop.NewBuilder().
+////		Version(1).
+////		Flags(0).
+////		TTL(5).
+////		Dest(env.ReturnPeerID).  // 回给 Alice
+////		Return(node.Key.PeerID). // From = Bootstrap
+////		Payload(respPayload).
+////		Build()
+////
+////	if err := node.PeerMgr.SendToPeer(env.ReturnPeerID, respEnv); err != nil {
+////		log.Println("[Bootstrap] FIND_NODE 响应发送失败:", err)
+////	}
+////}
+//
+/////****************************************************
+//// * Alice：处理 FIND_NODE 响应
+//// *
+//// *  收到 payload: "FIND_NODE_RESP:<target>:p1,p2,p3,..."
+//// ****************************************************/
+////func handleFindNodeResp(kad *router.KademliaTable, msg string) {
+////	parts := strings.SplitN(msg, ":", 3)
+////	if len(parts) != 3 {
+////		log.Println("[Alice] FIND_NODE_RESP 格式错误:", msg)
+////		return
+////	}
+////
+////	targetDomain := parts[1]
+////	peerListStr := parts[2]
+////
+////	log.Printf("[Alice] FIND_NODE_RESP: target=%s peersStr=%s", targetDomain, peerListStr)
+////
+////	if peerListStr == "" {
+////		log.Println("[Alice] 响应中没有任何节点。")
+////		return
+////	}
+////
+////	peerDomains := strings.Split(peerListStr, ",")
+////
+////	for _, dom := range peerDomains {
+////		id, err := peer.DomainToPeerID(dom)
+////		if err != nil {
+////			log.Println("[Alice] 解析 PeerID 失败:", err)
+////			continue
+////		}
+////		kad.Update(id)
+////		log.Printf("[Alice] 已学习节点: %s", dom)
+////	}
+////}
+//
+////package main
+////
+////import (
+////	"log"
+////
+////	"envelop/peer"
+////	"envelop/router"
+////)
+////
+/////*
+////==========================================================
+//// R8 Demo：本地 Kademlia 路由表使用示例
+////==========================================================
+////
+////这个 demo 不涉及 QUIC、Envelope，只演示：
+////
+////    1. 创建一个本节点 selfID
+////    2. 构建一张 Kademlia 路由表 table := NewKademliaTable(selfID)
+////    3. 往里丢入若干“邻居 PeerID”
+////    4. 对某个 targetID 调用 FindClosest(targetID, n)
+////    5. 打印出被选中的“下一跳候选节点”
+////
+////你可以先通过这个 demo 感受一下：
+////  - XOR 距离是如何排序的
+////  - KademliaTable 是如何只关心 PeerID，不关心 IP 的
+////
+////后面你要接到 Router.NextHop 上，只需要：
+////
+////    table.Update(见到的新 peerID)
+////    Router.NextHop = func(dest) (peer.PeerID, bool) {
+////        list := table.FindClosest(dest, 1)
+////        if len(list) == 0 { return zero, false }
+////        return list[0], true
+////    }
+////
+////==========================================================
+////*/
+////
+////func main() {
+////	// 1. 准备几个随机 PeerID（真实系统里是 NewKeyPair().PeerID）
+////	selfKP, _ := peer.NewKeyPair()
+////	peer1KP, _ := peer.NewKeyPair()
+////	peer2KP, _ := peer.NewKeyPair()
+////	peer3KP, _ := peer.NewKeyPair()
+////	peer4KP, _ := peer.NewKeyPair()
+////
+////	selfID := selfKP.PeerID
+////	p1 := peer1KP.PeerID
+////	p2 := peer2KP.PeerID
+////	p3 := peer3KP.PeerID
+////	p4 := peer4KP.PeerID
+////
+////	log.Println("=== R8 Kademlia Demo ===")
+////	log.Println("Self   =", peer.PeerIDToDomain(selfID))
+////	log.Println("Peer1  =", peer.PeerIDToDomain(p1))
+////	log.Println("Peer2  =", peer.PeerIDToDomain(p2))
+////	log.Println("Peer3  =", peer.PeerIDToDomain(p3))
+////	log.Println("Peer4  =", peer.PeerIDToDomain(p4))
+////
+////	// 2. 创建一张路由表，以 selfID 为中心
+////	table := router.NewKademliaTable(selfID)
+////
+////	// 3. 向路由表里学习这些邻居
+////	table.Update(p1)
+////	table.Update(p2)
+////	table.Update(p3)
+////	table.Update(p4)
+////
+////	// 4. 假设现在要路由到 Peer3
+////	target := p3
+////	log.Println("Target =", peer.PeerIDToDomain(target))
+////
+////	closest := table.FindClosest(target, 2) // 找最近的 2 个
+////	for i, id := range closest {
+////		log.Printf("  Closest[%d] = %s", i, peer.PeerIDToDomain(id))
+////	}
+////
+////	log.Println("Demo 结束：你已经有了一个可用的 Kademlia 路由表实现。")
+////}
+package main
+
+import (
+	"fmt"
+	"log"
+	"time"
+
+	"envelop/envelop"
+	"envelop/netquic"
+	"envelop/peer"
+	"envelop/router"
+	"envelop/socket"
+	"envelop/strategy"
+)
+
+// 这个 main 做一件最简单、但能把整个链路串起来的事：
+//
+//   本节点自己监听 9000 端口 → 自己通过 PeerID 发一条消息给自己 →
+//   Router 多跳逻辑（这里是直连） → PeerManager 通过 QUIC 发送 →
+//   Node 收到 → Router.HandleEnvelope → Socket 收到业务信封 → App 打印。
+//
+// 这样不需要真的起两个进程，就能验证：Frame / Envelope / Router / Node / Socket
+// 整个“框架链路”是通的。
+
+func main() {
+	////////////////////////////////////////////////////////////////////////////
+	// 1. 生成自己的 PeerID / KeyPair
+	////////////////////////////////////////////////////////////////////////////
+
+	// 你工程里真实的 API 是 NewKeyPair（在 peer/keypair.go），
+	// 没有 GenerateKeyPair，这里改成 NewKeyPair。
+	kp, err := peer.NewKeyPair()
+	if err != nil {
+		log.Fatal("NewKeyPair error:", err)
+	}
+	selfID := kp.PeerID
+
+	fmt.Println("My PeerID =", peer.PeerIDToDomain(selfID))
+
+	////////////////////////////////////////////////////////////////////////////
+	// 2. 创建 RelayRegistry + 注册自己的地址（PeerID → addr）
+	////////////////////////////////////////////////////////////////////////////
+
+	// RelayRegistry 是你现在 Demo 用的“地址数据库”，
+	// 用来做 PeerID ↔ 地址 的静态映射 / NAT Punching。
+	registry := netquic.NewRelayRegistry()
+
+	// 在本地注册自己：selfID 对应 127.0.0.1:9000。
+	// 这样 PeerManager 就可以通过 Resolver 找到自己的地址。
+	registry.RegisterStatic(selfID, "127.0.0.1:9000")
+
+	////////////////////////////////////////////////////////////////////////////
+	// 3. 创建 PeerManager（连接池 + QUIC Dial）—— 注入 resolver
+	////////////////////////////////////////////////////////////////////////////
+
+	// 你工程里的 NewPeerManager 签名是：
+	//   func NewPeerManager(resolver func(peer.PeerID) []string) *PeerManager
+	//
+	// 所以这里传 registry.Resolver，而不是 selfID。
+	pm := netquic.NewPeerManager(registry.Resolver)
+
+	////////////////////////////////////////////////////////////////////////////
+	// 4. 创建 Router（逻辑层：TTL / NextHop / Send / OnPayload）
+	////////////////////////////////////////////////////////////////////////////
+
+	// 你当前工程里 Router 是直接 struct，没有 NewRouter 构造函数，
+	// 我们先用字面量方式创建一个最简单的 Router：
+	r := &router.Router{
+		SelfID: selfID,
+		// RouteTable 暂时用不到，可以为 nil
+	}
+
+	// 当收到 REGISTER 信封（Flags=1）时的回调。
+	// 注意：你 Router 的 OnRegister 类型是 func(id peer.PeerID)，
+	// 不是 func(env *envelop.Envelope)，这里要对齐。
+	r.OnRegister = func(id peer.PeerID) {
+		fmt.Println("[Router] REGISTER from:", peer.PeerIDToDomain(id))
+	}
+
+	// NextHop：Demo 里我们认为所有目标都是“直连”的，
+	// 所以下一跳就是目标本身（真实环境可接 Kademlia RouteTable）。
+	r.NextHop = func(dest peer.PeerID) (peer.PeerID, bool) {
+		// 直连：NextHop(dest) = dest
+		return dest, true
+	}
+
+	// Send：Router 只负责“决定发给谁（nextHop）”，
+	// 真正发包交给 PeerManager.SendToPeer。
+	r.Send = func(nextHop peer.PeerID, env *envelop.Envelope) {
+		log.Printf("[Router] Send to %s", peer.PeerIDToDomain(nextHop))
+		if err := pm.SendToPeer(nextHop, env); err != nil {
+			log.Printf("[Router] SendToPeer error: %v", err)
+		}
+	}
+
+	////////////////////////////////////////////////////////////////////////////
+	// 5. 创建 Node（QUIC 网络层，负责 Listen / 处理 Frame / 调 Router）
+	////////////////////////////////////////////////////////////////////////////
+
+	// 你当前工程的 Node 结构在 netquic/node.go，是一个 struct：
+	//
+	//   type Node struct {
+	//       Name     string
+	//       Key      *peer.KeyPair
+	//       Router   *router.Router
+	//       PeerMgr  *PeerManager
+	//       Registry *RelayRegistry
+	//       ...
+	//   }
+	//
+	// 没有 NewNode(selfID, pm, r) 这种构造函数，这里用字面量初始化。
+	node := &netquic.Node{
+		Name:     "SelfNode",
+		Key:      kp,
+		Router:   r,
+		PeerMgr:  pm,
+		Registry: registry,
+	}
+
+	// 可选：收到 REGISTER 时的回调（QUIC 级别）
+	node.OnRegisterPeer = func(id peer.PeerID, addr string) {
+		log.Printf("[Node] OnRegisterPeer: %s @ %s", peer.PeerIDToDomain(id), addr)
+	}
+
+	// 可选：收到任意 Envelope 时的回调（在交给 Router 之前）
+	node.OnEnvelope = func(from peer.PeerID, env *envelop.Envelope) {
+		log.Printf("[Node] OnEnvelope from %s, Dest=%s TTL=%d",
+			peer.PeerIDToDomain(from),
+			peer.PeerIDToDomain(env.DestPeerID),
+			env.TTL,
+		)
+	}
+
+	////////////////////////////////////////////////////////////////////////////
+	// 6. 启动 QUIC 监听（单进程自连：既是 client 又是 server）
+	////////////////////////////////////////////////////////////////////////////
+
+	go func() {
+		// Node 里提供的是 ListenAndServe(addr string) 方法，
+		// 没有 Listen(":9000") 这个方法。
+		if err := node.ListenAndServe("0.0.0.0:9000"); err != nil {
+			log.Fatal("ListenAndServe error:", err)
+		}
+	}()
+	time.Sleep(500 * time.Millisecond)
+
+	////////////////////////////////////////////////////////////////////////////
+	// 7. 创建 Strategy（SimpleStrategy 一层信封策略）
+	////////////////////////////////////////////////////////////////////////////
+
+	// 你工程里的 SimpleStrategy 是一个 struct，没有 NewSimpleStrategy 函数。
+	// 我们直接用字面量初始化：
+	//
+	//   Key = nil        → 不做对称加密
+	//   DefaultTTL = 5   → 默认 TTL=5
+	strat := &strategy.SimpleStrategy{
+		Key:        nil,
+		DefaultTTL: 5,
+	}
+
+	////////////////////////////////////////////////////////////////////////////
+	// 8. 创建 Socket（Facade：对上暴露 Send / Recv；对下依赖 Router + Strategy）
+	////////////////////////////////////////////////////////////////////////////
+
+	// RouterEnvelopeSender：把“最外层 Envelope”交给 Router，由 Router+PeerManager 负责多跳转发。
+	sender := &socket.RouterEnvelopeSender{R: r}
+
+	// NewSocket 会自动接管 r.OnPayload，把最终业务信封转成 IncomingMessage 发到 chan 里。
+	sock := socket.NewSocket(selfID, strat, sender, r)
+
+	////////////////////////////////////////////////////////////////////////////
+	// 9. 启动接收循环（应用层逻辑）
+	////////////////////////////////////////////////////////////////////////////
+
+	go func() {
+		for msg := range sock.Recv() {
+			fmt.Printf("[App] from %s: %s\n",
+				peer.PeerIDToDomain(msg.From),
+				string(msg.Payload),
+			)
+		}
+	}()
+
+	////////////////////////////////////////////////////////////////////////////
+	// 10. Demo：给“自己”发一条消息（自发自收，跑通整个链路）
+	////////////////////////////////////////////////////////////////////////////
+
+	log.Println("Sending message to self...")
+
+	go func() {
+		time.Sleep(time.Second)
+
+		// 这里直接把目标设为 selfID，
+		//   Router.NextHop(selfID) → selfID
+		//   PeerManager.SendToPeer(selfID, env) → 通过 registry.Resolver 找到 127.0.0.1:9000
+		//   QUIC 连接到自己 → Node.handleStream → Router.HandleEnvelope → Socket.Recv
+		if err := sock.Send(selfID, []byte("hello from EnvelopSocket")); err != nil {
+			log.Println("sock.Send error:", err)
+		} else {
+			log.Println("sock.Send ok")
+		}
+	}()
+
+	// 阻塞住 main，等待 goroutine 的输出。
+	select {}
+}
